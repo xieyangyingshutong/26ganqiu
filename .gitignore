@@ -25,6 +25,7 @@
 *.lst
 *.i
 *.s
+!CMSIS/startup_stm32f10x_md.s
 *.scr
 *.o.0
 *.so
