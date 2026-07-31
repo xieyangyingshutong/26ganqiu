@@ -25,7 +25,6 @@ static bool controller_armed = false;
 static bool setpoint_filter_initialized = false;
 static bool motor_link_ready = false;
 static uint8_t last_camera_sequence = 0U;
-static uint8_t last_camera_mode = 0U;
 
 static float control_absf(float value)
 {
@@ -148,12 +147,13 @@ static void ball_control_send_absolute_position(int32_t target_pulses)
 	++ball_control_status.motor_commands_sent;
 }
 
-static void ball_control_reset_pid(void)
+static void ball_control_reset_transient_state(void)
 {
-	pid_integral_output_deg = 0.0f;
 	last_pid_update_ms = 0U;
 	setpoint_filter_initialized = false;
-	ball_control_status.integral_output_deg = 0.0f;
+	/* Keep the integral output: it is the learned neutral-angle correction
+	 * for tube slope, crank preload and static mechanical bias. */
+	ball_control_status.integral_output_deg = pid_integral_output_deg;
 	ball_control_status.output_angle_deg = 0.0f;
 	ball_control_status.error_mm = 0.0f;
 }
@@ -168,7 +168,7 @@ static void ball_control_enter_safe_state(BallControlState_t state)
 
 	if(controller_armed)
 	{
-		ball_control_reset_pid();
+		ball_control_reset_transient_state();
 	}
 
 	controller_armed = false;
@@ -249,7 +249,6 @@ void ball_control_init(void)
 	setpoint_filter_initialized = false;
 	motor_link_ready = false;
 	last_camera_sequence = 0U;
-	last_camera_mode = 0U;
 	last_camera_packet_ms = 0U;
 	last_ball_fresh_ms = 0U;
 	last_pid_update_ms = 0U;
@@ -267,7 +266,14 @@ void ball_control_init(void)
 	delay_ms(20);
 #endif
 
+	/* A zero command alone does not select a repeatable side of the crank
+	 * backlash. Move away and return to level from the same side on every boot. */
+#if (BALL_MOTOR_STARTUP_PRELOAD_PULSES != BALL_MOTOR_LEVEL_PULSES)
+	ball_control_send_absolute_position(BALL_MOTOR_STARTUP_PRELOAD_PULSES);
+	delay_ms(BALL_MOTOR_STARTUP_PRELOAD_HOLD_MS);
+#endif
 	ball_control_send_absolute_position(BALL_MOTOR_LEVEL_PULSES);
+	delay_ms(BALL_MOTOR_STARTUP_PRELOAD_HOLD_MS);
 	motor_link_ready = true;
 	ball_control_status.motor_link_ready = 1U;
 }
@@ -292,7 +298,6 @@ void ball_control_handle_camera_packet(const CameraPacket_t *packet,
 	int32_t target_pulses;
 	uint32_t prediction_age_ms;
 	uint32_t packet_age_ms;
-	uint8_t camera_mode;
 
 	if(packet == 0)
 	{
@@ -350,13 +355,8 @@ void ball_control_handle_camera_packet(const CameraPacket_t *packet,
 
 	ball_control_status.ball_position_mm = position_mm;
 	ball_control_status.ball_velocity_mm_s = velocity_mm_s;
-	camera_mode = (uint8_t)((packet->flags & CAMERA_FLAG_MODE_MASK) >> 4);
-	if(controller_armed && (last_camera_mode != 0U) &&
-	   (camera_mode != last_camera_mode))
-	{
-		pid_integral_output_deg = 0.0f;
-	}
-	last_camera_mode = camera_mode;
+	/* Keep the learned neutral bias across mode changes. The setpoint slew
+	 * limiter handles the target transition without throwing the bias away. */
 	ball_control_status.requested_setpoint_mm = requested_setpoint;
 	++ball_control_status.accepted_packets;
 
@@ -387,7 +387,6 @@ void ball_control_handle_camera_packet(const CameraPacket_t *packet,
 		}
 
 		controller_armed = true;
-		pid_integral_output_deg = 0.0f;
 		filtered_setpoint_mm = position_mm;
 		setpoint_filter_initialized = true;
 		last_pid_update_ms = now_ms;
@@ -447,9 +446,9 @@ void ball_control_handle_camera_packet(const CameraPacket_t *packet,
 	}
 	else
 	{
-		/* Predictions and large errors must not retain a long-lived bias. */
-		candidate_integral *= control_clampf(1.0f - dt_seconds * 0.8f,
-		                                     0.0f, 1.0f);
+		/* Freeze during short predictions/edge recovery. Decaying here made
+		 * ordinary detector flicker continually erase the level correction. */
+		candidate_integral = pid_integral_output_deg;
 	}
 
 	ball_control_get_output_limits(
@@ -528,6 +527,16 @@ void ball_control_service(uint32_t now_ms)
 		ball_control_status.state = BALL_CONTROL_WAITING_CAMERA;
 		desired_motor_pulses = BALL_MOTOR_LEVEL_PULSES;
 		ball_control_status.desired_motor_pulses = BALL_MOTOR_LEVEL_PULSES;
+	}
+
+	/* Do not retain a stale correction forever when the real ball has been
+	 * absent. Short dropouts keep it; a long absence starts cleanly. */
+	if(!controller_armed && (last_ball_fresh_ms != 0U) &&
+	   ((uint32_t)(now_ms - last_ball_fresh_ms) >
+	    BALL_PID_INTEGRAL_MEMORY_MS))
+	{
+		pid_integral_output_deg = 0.0f;
+		ball_control_status.integral_output_deg = 0.0f;
 	}
 
 	service_elapsed_ms = (uint32_t)(now_ms - last_motor_service_ms);
