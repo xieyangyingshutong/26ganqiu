@@ -27,6 +27,8 @@ typedef struct {
 	float ball_velocity_mm_s;
 	float error_mm;
 	float integral_output_deg;
+	float stiction_boost_deg;
+	uint32_t stiction_time_ms;
 	float output_angle_deg;
 	int32_t desired_motor_pulses;
 	int32_t sent_motor_pulses;
