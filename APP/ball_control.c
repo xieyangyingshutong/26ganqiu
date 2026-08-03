@@ -9,6 +9,7 @@ __IO BallControlStatus_t ball_control_status;
 
 static float pid_integral_output_deg = 0.0f;
 static float filtered_setpoint_mm = 0.0f;
+static float stiction_boost_deg = 0.0f;
 static int32_t desired_motor_pulses = BALL_MOTOR_LEVEL_PULSES;
 static int32_t sent_motor_pulses = BALL_MOTOR_LEVEL_PULSES;
 
@@ -17,6 +18,7 @@ static uint32_t last_ball_fresh_ms = 0U;
 static uint32_t last_pid_update_ms = 0U;
 static uint32_t last_motor_service_ms = 0U;
 static uint32_t last_motor_send_ms = 0U;
+static uint32_t stiction_candidate_since_ms = 0U;
 
 static uint8_t fresh_packet_streak = 0U;
 static bool camera_packet_seen = false;
@@ -25,6 +27,7 @@ static bool controller_armed = false;
 static bool setpoint_filter_initialized = false;
 static bool motor_link_ready = false;
 static uint8_t last_camera_sequence = 0U;
+static int8_t stiction_direction = 0;
 
 static float control_absf(float value)
 {
@@ -151,9 +154,14 @@ static void ball_control_reset_transient_state(void)
 {
 	last_pid_update_ms = 0U;
 	setpoint_filter_initialized = false;
+	stiction_boost_deg = 0.0f;
+	stiction_candidate_since_ms = 0U;
+	stiction_direction = 0;
 	/* Keep the integral output: it is the learned neutral-angle correction
 	 * for tube slope, crank preload and static mechanical bias. */
 	ball_control_status.integral_output_deg = pid_integral_output_deg;
+	ball_control_status.stiction_boost_deg = 0.0f;
+	ball_control_status.stiction_time_ms = 0U;
 	ball_control_status.output_angle_deg = 0.0f;
 	ball_control_status.error_mm = 0.0f;
 }
@@ -198,6 +206,68 @@ static float ball_control_slew(float current, float target,
 	return current + difference;
 }
 
+static void ball_control_update_stiction(bool ball_fresh,
+	                                     bool edge_recovery,
+	                                     float error_mm,
+	                                     float velocity_mm_s,
+	                                     float dt_seconds,
+	                                     uint32_t now_ms)
+{
+	int8_t requested_direction;
+	uint32_t stuck_time_ms;
+	float requested_boost;
+
+	/* A predicted position cannot prove that the ball is stationary. Hold the
+	 * current decision for a short prediction; the normal safety timeout will
+	 * reset it if fresh measurements do not return. */
+	if(!ball_fresh)
+	{
+		return;
+	}
+
+	if(edge_recovery ||
+	   (control_absf(error_mm) < BALL_STICTION_ERROR_THRESHOLD_MM) ||
+	   (control_absf(velocity_mm_s) >
+	    BALL_STICTION_VELOCITY_THRESHOLD_MM_S))
+	{
+		stiction_candidate_since_ms = 0U;
+		stiction_direction = 0;
+		stiction_boost_deg = ball_control_slew(
+			stiction_boost_deg, 0.0f,
+			BALL_STICTION_BOOST_FALL_DEG_PER_S, dt_seconds);
+		ball_control_status.stiction_boost_deg = stiction_boost_deg;
+		ball_control_status.stiction_time_ms = 0U;
+		return;
+	}
+
+	requested_direction = (error_mm > 0.0f) ? 1 : -1;
+	if(stiction_direction != requested_direction)
+	{
+		stiction_direction = requested_direction;
+		stiction_candidate_since_ms = now_ms;
+		stiction_boost_deg = 0.0f;
+	}
+
+	stuck_time_ms = (uint32_t)(now_ms - stiction_candidate_since_ms);
+	if(stuck_time_ms >= BALL_STICTION_CONFIRM_MS)
+	{
+		requested_boost = (float)stiction_direction *
+		                  BALL_STICTION_MAX_BOOST_DEG;
+		stiction_boost_deg = ball_control_slew(
+			stiction_boost_deg, requested_boost,
+			BALL_STICTION_BOOST_RISE_DEG_PER_S, dt_seconds);
+	}
+	else
+	{
+		stiction_boost_deg = ball_control_slew(
+			stiction_boost_deg, 0.0f,
+			BALL_STICTION_BOOST_FALL_DEG_PER_S, dt_seconds);
+	}
+
+	ball_control_status.stiction_boost_deg = stiction_boost_deg;
+	ball_control_status.stiction_time_ms = stuck_time_ms;
+}
+
 static bool ball_control_packet_values_valid(const CameraPacket_t *packet)
 {
 	if(((packet->flags & CAMERA_FLAG_BALL_VALID) == 0U) ||
@@ -228,6 +298,8 @@ void ball_control_init(void)
 	ball_control_status.ball_velocity_mm_s = 0.0f;
 	ball_control_status.error_mm = 0.0f;
 	ball_control_status.integral_output_deg = 0.0f;
+	ball_control_status.stiction_boost_deg = 0.0f;
+	ball_control_status.stiction_time_ms = 0U;
 	ball_control_status.output_angle_deg = 0.0f;
 	ball_control_status.desired_motor_pulses = BALL_MOTOR_LEVEL_PULSES;
 	ball_control_status.sent_motor_pulses = BALL_MOTOR_LEVEL_PULSES;
@@ -240,6 +312,7 @@ void ball_control_init(void)
 
 	pid_integral_output_deg = 0.0f;
 	filtered_setpoint_mm = 0.0f;
+	stiction_boost_deg = 0.0f;
 	desired_motor_pulses = BALL_MOTOR_LEVEL_PULSES;
 	sent_motor_pulses = BALL_MOTOR_LEVEL_PULSES;
 	fresh_packet_streak = 0U;
@@ -254,6 +327,8 @@ void ball_control_init(void)
 	last_pid_update_ms = 0U;
 	last_motor_service_ms = 0U;
 	last_motor_send_ms = 0U;
+	stiction_candidate_since_ms = 0U;
+	stiction_direction = 0;
 
 	/* Use the same startup order as the hardware-proven ZDT\1 project. The
 	 * motor is intentionally controlled one-way so a missing PA10 reply or an
@@ -456,9 +531,13 @@ void ball_control_handle_camera_packet(const CameraPacket_t *packet,
 		                BALL_PID_MAX_BEAM_ANGLE_DEG,
 		&lower_output_limit,
 		&upper_output_limit);
+	ball_control_update_stiction(ball_fresh, edge_recovery,
+	                             error_mm, velocity_mm_s,
+	                             dt_seconds, now_ms);
 	unsaturated_output = BALL_PID_KP_DEG_PER_MM * pid_error_mm +
 	                     candidate_integral -
-	                     BALL_PID_KD_DEG_PER_MM_PER_S * velocity_mm_s;
+	                     BALL_PID_KD_DEG_PER_MM_PER_S * velocity_mm_s +
+	                     stiction_boost_deg;
 
 	/* Conditional integration: reject only an integral change that deepens
 	 * saturation. This still permits deliberate bias decay during prediction. */
@@ -470,7 +549,8 @@ void ball_control_handle_camera_packet(const CameraPacket_t *packet,
 		candidate_integral = pid_integral_output_deg;
 		unsaturated_output = BALL_PID_KP_DEG_PER_MM * pid_error_mm +
 		                     candidate_integral -
-		                     BALL_PID_KD_DEG_PER_MM_PER_S * velocity_mm_s;
+		                     BALL_PID_KD_DEG_PER_MM_PER_S * velocity_mm_s +
+		                     stiction_boost_deg;
 	}
 	pid_integral_output_deg = candidate_integral;
 	output_angle = control_clampf(unsaturated_output,

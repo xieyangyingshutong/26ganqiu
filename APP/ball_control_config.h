@@ -42,7 +42,7 @@
 #define BALL_MOTOR_COMMAND_KEEPALIVE_MS            500U
 #define BALL_MOTOR_MAX_SLEW_DT_MS                   50U
 #define BALL_MOTOR_MAX_STEP_PULSES                  24L
-#define BALL_MOTOR_MIN_CHANGE_PULSES                 2L
+#define BALL_MOTOR_MIN_CHANGE_PULSES                 1L
 
 /* ---------------------------- PID parameters ---------------------------- */
 
@@ -61,6 +61,16 @@
 /* A short visual dropout must not erase the learned tube-level bias. Clear it
  * only after the real ball has been absent continuously for this long. */
 #define BALL_PID_INTEGRAL_MEMORY_MS                5000U
+
+/* Static-friction release. When the ball has a visible position error but is
+ * nearly stationary, add a temporary tilt in the error direction. The boost
+ * ramps in/out so that a released ball is not hit by a discontinuous command. */
+#define BALL_STICTION_ERROR_THRESHOLD_MM             5.0f
+#define BALL_STICTION_VELOCITY_THRESHOLD_MM_S        8.0f
+#define BALL_STICTION_CONFIRM_MS                    300U
+#define BALL_STICTION_MAX_BOOST_DEG                   1.5f
+#define BALL_STICTION_BOOST_RISE_DEG_PER_S            2.5f
+#define BALL_STICTION_BOOST_FALL_DEG_PER_S            5.0f
 
 /* Limits reference and actuator changes independently of the PID gains. */
 #define BALL_SETPOINT_SLEW_MM_PER_S                 80.0f
